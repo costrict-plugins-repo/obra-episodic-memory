@@ -1,0 +1,1414 @@
+import fs from 'fs';
+import readline from 'readline';
+import path from 'path';
+import { ConversationExchange, ConversationHarness, ToolCall } from './types.js';
+import crypto from 'crypto';
+
+interface JSONLMessage {
+  type: string;
+  message?: {
+    role: 'user' | 'assistant';
+    content: string | Array<any>;
+    model?: string;
+  };
+  timestamp?: string;
+  uuid?: string;
+  parentUuid?: string;
+  isSidechain?: boolean;
+  isMeta?: boolean;
+  origin?: { kind?: string; [key: string]: unknown };
+  sessionId?: string;
+  cwd?: string;
+  gitBranch?: string;
+  version?: string;
+  thinkingMetadata?: {
+    level?: string;
+    disabled?: boolean;
+    triggers?: Array<any>;
+  };
+}
+
+interface CodexRolloutLine {
+  timestamp?: string;
+  type?: string;
+  payload?: any;
+}
+
+interface CursorTranscriptLine {
+  role?: 'user' | 'assistant';
+  message?: {
+    content?: string | Array<any>;
+  };
+  type?: string; // present on status/error noise lines, absent on messages
+  // Embedded by `import-cursor-history` legacy exports; absent in live
+  // ~/.cursor/projects agent transcripts:
+  timestamp?: string;
+  sessionId?: string;
+  cwd?: string;
+}
+
+interface OpencodeJsonlLine {
+  type?: string;
+  session?: any;
+  project?: any;
+  sessionID?: string;
+  message?: any;
+  parts?: any[];
+}
+
+interface OmpJsonlLine {
+  type?: string;
+  id?: string;
+  parentId?: string | null;
+  timestamp?: string;
+  cwd?: string;
+  payload?: any;
+  message?: {
+    role?: 'user' | 'assistant';
+    content?: string | Array<any>;
+  };
+}
+
+interface ExchangeBuilder {
+  project: string;
+  userMessage: string;
+  userLine: number;
+  assistantMessages: string[];
+  lastAssistantLine: number;
+  timestamp: string;
+  parentUuid?: string;
+  isSidechain?: boolean;
+  harness?: ConversationHarness;
+  sessionId?: string;
+  cwd?: string;
+  gitBranch?: string;
+  claudeVersion?: string;
+  agentVersion?: string;
+  model?: string;
+  modelProvider?: string;
+  thinkingLevel?: string;
+  thinkingDisabled?: boolean;
+  thinkingTriggers?: string;
+  toolCalls: ToolCall[];
+}
+
+async function detectConversationHarness(filePath: string): Promise<ConversationHarness> {
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as CodexRolloutLine;
+      if (
+        parsed.type === 'opencode_session' ||
+        parsed.type === 'opencode_message'
+      ) {
+        return 'opencode';
+      }
+      if (
+        parsed.payload &&
+        (parsed.type === 'session_meta' ||
+          parsed.type === 'turn_context' ||
+          parsed.type === 'response_item' ||
+          parsed.type === 'event_msg' ||
+          parsed.type === 'compacted')
+      ) {
+        return 'codex';
+      }
+      // Oh My Pi (OMP) pi-lineage transcripts open with a bare session header
+      // ({type:"session", id, cwd}) with no payload/session sub-object (which
+      // would be Codex/opencode), and their turns are {type:"message",
+      // message:{role, content}} — a shape no other harness uses. Current OMP
+      // writes a fixed-width {type:"title"} slot before the header; skip it so
+      // the header decides instead of the Claude fallback.
+      if (parsed.type === 'title') {
+        continue;
+      }
+      const maybeOmp = parsed as OmpJsonlLine;
+      if (parsed.type === 'session' && !parsed.payload && !(maybeOmp as any).session) {
+        return 'omp';
+      }
+      if (parsed.type === 'message' && maybeOmp.message && maybeOmp.message.role) {
+        return 'omp';
+      }
+      // Cursor agent transcripts (~/.cursor/projects/<slug>/agent-transcripts/)
+      // carry role+message with no top-level type field.
+      const maybeCursor = parsed as CursorTranscriptLine;
+      if (parsed.type === undefined && maybeCursor.role && maybeCursor.message) {
+        return 'cursor';
+      }
+      // Cursor transcripts also contain status/error noise lines; skip them
+      // rather than misdetecting the file as a Claude conversation.
+      if (parsed.type === 'status' || parsed.type === 'error') {
+        continue;
+      }
+      return 'claude';
+    } catch {
+      continue;
+    }
+  }
+
+  return 'claude';
+}
+
+export async function parseConversation(
+  filePath: string,
+  projectName: string,
+  archivePath: string
+): Promise<ConversationExchange[]> {
+  const harness = await detectConversationHarness(filePath);
+  if (harness === 'codex') {
+    return parseCodexConversation(filePath, projectName, archivePath);
+  }
+  if (harness === 'cursor') {
+    return parseCursorConversation(filePath, projectName, archivePath);
+  }
+  if (harness === 'opencode') {
+    return parseOpencodeConversation(filePath, projectName, archivePath);
+  }
+  if (harness === 'omp') {
+    return parseOmpConversation(filePath, projectName, archivePath);
+  }
+  return parseClaudeConversation(filePath, projectName, archivePath);
+}
+
+// Channel-bridge plugins (Discord, Slack, ...) deliver the user's own words as
+// isMeta:true user lines with origin.kind === "channel" (anthropics/claude-code#44828),
+// so isMeta alone does not mean "not the user's input"; provenance is in origin.kind.
+const HUMAN_ORIGIN_KINDS = new Set(['channel', 'human']);
+
+function isInjectedMetaLine(msg: JSONLMessage): boolean {
+  if (msg.isMeta !== true) return false;
+  const kind = msg.origin?.kind;
+  return !(typeof kind === 'string' && HUMAN_ORIGIN_KINDS.has(kind));
+}
+
+async function parseClaudeConversation(
+  filePath: string,
+  projectName: string,
+  archivePath: string
+): Promise<ConversationExchange[]> {
+  const exchanges: ConversationExchange[] = [];
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  let lineNumber = 0;
+  let currentExchange: ExchangeBuilder | null = null;
+
+  const finalizeExchange = () => {
+    if (currentExchange && currentExchange.assistantMessages.length > 0) {
+      const exchangeId = crypto
+        .createHash('md5')
+        .update(`${archivePath}:${currentExchange.userLine}-${currentExchange.lastAssistantLine}`)
+        .digest('hex');
+
+      // Update tool call exchange IDs
+      const toolCalls = currentExchange.toolCalls.map(tc => ({
+        ...tc,
+        exchangeId
+      }));
+
+      const exchange: ConversationExchange = {
+        id: exchangeId,
+        project: currentExchange.project,
+        timestamp: currentExchange.timestamp,
+        userMessage: currentExchange.userMessage,
+        assistantMessage: currentExchange.assistantMessages.join('\n\n'),
+        archivePath,
+        lineStart: currentExchange.userLine,
+        lineEnd: currentExchange.lastAssistantLine,
+        parentUuid: currentExchange.parentUuid,
+        isSidechain: currentExchange.isSidechain,
+        harness: currentExchange.harness,
+        sessionId: currentExchange.sessionId,
+        cwd: currentExchange.cwd,
+        gitBranch: currentExchange.gitBranch,
+        claudeVersion: currentExchange.claudeVersion,
+        agentVersion: currentExchange.agentVersion,
+        model: currentExchange.model,
+        modelProvider: currentExchange.modelProvider,
+        thinkingLevel: currentExchange.thinkingLevel,
+        thinkingDisabled: currentExchange.thinkingDisabled,
+        thinkingTriggers: currentExchange.thinkingTriggers,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+      };
+      exchanges.push(exchange);
+    }
+  };
+
+  for await (const line of rl) {
+    lineNumber++;
+
+    try {
+      const parsed: JSONLMessage = JSON.parse(line);
+
+      // Skip non-message types
+      if (parsed.type !== 'user' && parsed.type !== 'assistant') {
+        continue;
+      }
+
+      if (!parsed.message) {
+        continue;
+      }
+
+      // Harness-injected user lines carry isMeta:true: image-paste placeholders
+      // ("[Image: source: ...]"), Skill tool bodies, task/system notifications,
+      // local-command caveats, coordinator messages, "Continue from where you
+      // left off.". They are not the user's words, so while an exchange is open
+      // they must not start a new one: a pasted image yields the real prompt line
+      // followed by an isMeta placeholder line with no assistant reply between,
+      // and finalizeExchange() would drop the real prompt. Their text is not
+      // indexed; the assistant lines that follow attach to the open exchange.
+      // With no exchange open (a session that opens with a notification) the
+      // line still starts one, so no assistant text is ever lost.
+      if (parsed.message.role === 'user' && currentExchange && isInjectedMetaLine(parsed)) {
+        continue;
+      }
+
+      // Extract text from message content
+      let text = '';
+      const toolCalls: ToolCall[] = [];
+
+      if (typeof parsed.message.content === 'string') {
+        text = parsed.message.content;
+      } else if (Array.isArray(parsed.message.content)) {
+        // Extract text blocks
+        const textBlocks = parsed.message.content
+          .filter(block => block.type === 'text' && block.text)
+          .map(block => block.text);
+        text = textBlocks.join('\n');
+
+        // Extract tool use blocks
+        if (parsed.message.role === 'assistant') {
+          for (const block of parsed.message.content) {
+            if (block.type === 'tool_use') {
+              const toolCallId = crypto.randomUUID();
+              toolCalls.push({
+                id: toolCallId,
+                exchangeId: '', // Will be set when we know the exchange ID
+                toolName: block.name || 'unknown',
+                toolInput: block.input,
+                isError: false,
+                timestamp: parsed.timestamp || new Date().toISOString()
+              });
+            }
+          }
+        }
+
+        // Extract tool results
+        if (parsed.message.role === 'user') {
+          for (const block of parsed.message.content) {
+            if (block.type === 'tool_result') {
+              // Store for later association with tool_use
+              // For now, we'll just track results exist
+              // TODO: Match tool_use_id to previous tool_use
+            }
+          }
+        }
+      }
+
+      // Skip empty messages
+      if (!text.trim() && toolCalls.length === 0) {
+        continue;
+      }
+
+      if (parsed.message.role === 'user') {
+        // Finalize previous exchange before starting new one
+        finalizeExchange();
+
+        // Start new exchange
+        currentExchange = {
+          project: projectName,
+          userMessage: text || '(tool results only)',
+          userLine: lineNumber,
+          assistantMessages: [],
+          lastAssistantLine: lineNumber,
+          timestamp: parsed.timestamp || new Date().toISOString(),
+          parentUuid: parsed.parentUuid,
+          isSidechain: parsed.isSidechain,
+          harness: 'claude',
+          sessionId: parsed.sessionId,
+          cwd: parsed.cwd,
+          gitBranch: parsed.gitBranch,
+          claudeVersion: parsed.version,
+          agentVersion: parsed.version,
+          model: parsed.message.model,
+          thinkingLevel: parsed.thinkingMetadata?.level,
+          thinkingDisabled: parsed.thinkingMetadata?.disabled,
+          thinkingTriggers: parsed.thinkingMetadata?.triggers ? JSON.stringify(parsed.thinkingMetadata.triggers) : undefined,
+          toolCalls: []
+        };
+      } else if (parsed.message.role === 'assistant' && currentExchange) {
+        // Accumulate assistant messages
+        if (text.trim()) {
+          currentExchange.assistantMessages.push(text);
+        }
+        currentExchange.lastAssistantLine = lineNumber;
+
+        // Add tool calls to current exchange
+        if (toolCalls.length > 0) {
+          currentExchange.toolCalls.push(...toolCalls);
+        }
+
+        // Update timestamp to last assistant message
+        if (parsed.timestamp) {
+          currentExchange.timestamp = parsed.timestamp;
+        }
+
+        // Update metadata from assistant messages (use most recent)
+        if (parsed.sessionId) currentExchange.sessionId = parsed.sessionId;
+        if (parsed.cwd) currentExchange.cwd = parsed.cwd;
+        if (parsed.gitBranch) currentExchange.gitBranch = parsed.gitBranch;
+        if (parsed.version) {
+          currentExchange.claudeVersion = parsed.version;
+          currentExchange.agentVersion = parsed.version;
+        }
+        if (parsed.message.model) currentExchange.model = parsed.message.model;
+      }
+    } catch (error) {
+      // Skip malformed JSON lines
+      continue;
+    }
+  }
+
+  // Finalize last exchange
+  finalizeExchange();
+
+  return exchanges;
+}
+
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return '';
+  }
+
+  return content
+    .filter(block => block && typeof block === 'object' && typeof (block as any).text === 'string')
+    .map(block => (block as any).text)
+    .join('\n');
+}
+
+function safeParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function stringifyToolOutput(output: unknown): string | undefined {
+  if (output === undefined || output === null) {
+    return undefined;
+  }
+  if (typeof output === 'string') {
+    return output;
+  }
+
+  const text = extractTextFromContent(output);
+  if (text.trim()) {
+    return text;
+  }
+
+  return JSON.stringify(output);
+}
+
+function projectFromCwd(cwd?: string): string | undefined {
+  if (!cwd) {
+    return undefined;
+  }
+  const project = path.basename(cwd);
+  return project || undefined;
+}
+
+function isoFromMillis(value: unknown): string | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function opencodeModelId(model: unknown): string | undefined {
+  if (!model || typeof model !== 'object') {
+    return undefined;
+  }
+  const value = model as any;
+  return value.id || value.modelID;
+}
+
+function opencodeModelProvider(model: unknown): string | undefined {
+  if (!model || typeof model !== 'object') {
+    return undefined;
+  }
+  const value = model as any;
+  return value.providerID;
+}
+
+function extractOpencodeText(parts: any[] | undefined): string {
+  if (!Array.isArray(parts)) {
+    return '';
+  }
+  return parts
+    .filter(part => part?.type === 'text' && typeof part.text === 'string')
+    .map(part => part.text)
+    .join('\n');
+}
+
+function timestampFromOpencodeMessage(message: any, fallback?: string): string {
+  return isoFromMillis(message?.time?.completed) ||
+    isoFromMillis(message?.time?.created) ||
+    isoFromMillis(message?.timeUpdated) ||
+    isoFromMillis(message?.timeCreated) ||
+    fallback ||
+    new Date().toISOString();
+}
+
+function extractOpencodeToolCalls(parts: any[] | undefined, fallbackTimestamp: string): ToolCall[] {
+  if (!Array.isArray(parts)) {
+    return [];
+  }
+
+  const toolCalls: ToolCall[] = [];
+  for (const part of parts) {
+    if (!part || part.type !== 'tool') {
+      continue;
+    }
+
+    const state = part.state || {};
+    const timestamp = isoFromMillis(state.time?.start) ||
+      isoFromMillis(part.time?.start) ||
+      isoFromMillis(part.timeCreated) ||
+      fallbackTimestamp;
+    const status = typeof state.status === 'string' ? state.status.toLowerCase() : '';
+
+    toolCalls.push({
+      id: part.callID || part.id || crypto.randomUUID(),
+      exchangeId: '',
+      toolName: part.tool || 'unknown',
+      toolInput: state.input,
+      toolResult: stringifyToolOutput(state.output),
+      isError: Boolean(status && status !== 'completed'),
+      timestamp,
+    });
+  }
+
+  return toolCalls;
+}
+
+async function parseOpencodeConversation(
+  filePath: string,
+  projectName: string,
+  archivePath: string
+): Promise<ConversationExchange[]> {
+  const exchanges: ConversationExchange[] = [];
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  let lineNumber = 0;
+  let sessionId: string | undefined;
+  let cwd: string | undefined;
+  let agentVersion: string | undefined;
+  let agent: string | undefined;
+  let model: string | undefined;
+  let modelProvider: string | undefined;
+  let currentExchange: ExchangeBuilder | null = null;
+
+  const currentProject = () => projectFromCwd(cwd) || projectName;
+
+  const applyMetadataToCurrentExchange = () => {
+    if (!currentExchange) {
+      return;
+    }
+    currentExchange.project = currentProject();
+    currentExchange.sessionId = sessionId;
+    currentExchange.cwd = cwd;
+    currentExchange.agentVersion = agentVersion;
+    currentExchange.model = model;
+    currentExchange.modelProvider = modelProvider;
+  };
+
+  const finalizeExchange = () => {
+    if (currentExchange && currentExchange.assistantMessages.length > 0) {
+      applyMetadataToCurrentExchange();
+      const exchangeId = crypto
+        .createHash('md5')
+        .update(`${archivePath}:${currentExchange.userLine}-${currentExchange.lastAssistantLine}`)
+        .digest('hex');
+
+      const toolCalls = currentExchange.toolCalls.map(tc => ({
+        ...tc,
+        exchangeId
+      }));
+
+      exchanges.push({
+        id: exchangeId,
+        project: currentExchange.project,
+        timestamp: currentExchange.timestamp,
+        userMessage: currentExchange.userMessage,
+        assistantMessage: currentExchange.assistantMessages.join('\n\n'),
+        archivePath,
+        lineStart: currentExchange.userLine,
+        lineEnd: currentExchange.lastAssistantLine,
+        harness: 'opencode',
+        sessionId: currentExchange.sessionId,
+        cwd: currentExchange.cwd,
+        agentVersion: currentExchange.agentVersion,
+        model: currentExchange.model,
+        modelProvider: currentExchange.modelProvider,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+      });
+    }
+    currentExchange = null;
+  };
+
+  const startExchange = (text: string, timestamp: string) => {
+    finalizeExchange();
+    currentExchange = {
+      project: currentProject(),
+      userMessage: text,
+      userLine: lineNumber,
+      assistantMessages: [],
+      lastAssistantLine: lineNumber,
+      timestamp,
+      harness: 'opencode',
+      sessionId,
+      cwd,
+      agentVersion,
+      model,
+      modelProvider,
+      toolCalls: []
+    };
+  };
+
+  for await (const line of rl) {
+    lineNumber++;
+    if (!line.trim()) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(line) as OpencodeJsonlLine;
+
+      if (parsed.type === 'opencode_session' && parsed.session) {
+        sessionId = parsed.session.id || sessionId;
+        cwd = parsed.session.directory || parsed.project?.worktree || cwd;
+        agentVersion = parsed.session.version || agentVersion;
+        agent = parsed.session.agent || agent;
+        model = opencodeModelId(parsed.session.model) || model;
+        modelProvider = opencodeModelProvider(parsed.session.model) || modelProvider;
+        applyMetadataToCurrentExchange();
+        continue;
+      }
+
+      if (parsed.type !== 'opencode_message' || !parsed.message) {
+        continue;
+      }
+
+      const message = parsed.message;
+      const timestamp = timestampFromOpencodeMessage(message);
+      if (message.sessionID || parsed.sessionID) {
+        sessionId = message.sessionID || parsed.sessionID;
+      }
+      if (message.agent) {
+        agent = message.agent;
+      }
+      if (message.path?.cwd) {
+        cwd = message.path.cwd;
+      }
+      if (message.modelID) {
+        model = message.modelID;
+      } else if (message.model) {
+        model = opencodeModelId(message.model) || model;
+      }
+      if (message.providerID) {
+        modelProvider = message.providerID;
+      } else if (message.model) {
+        modelProvider = opencodeModelProvider(message.model) || modelProvider;
+      }
+
+      const text = extractOpencodeText(parsed.parts);
+      if (message.role === 'user') {
+        if (!text.trim()) {
+          continue;
+        }
+        startExchange(text, timestamp);
+      } else if (message.role === 'assistant') {
+        const exchange = currentExchange as ExchangeBuilder | null;
+        if (exchange) {
+          if (text.trim()) {
+            exchange.assistantMessages.push(text);
+          }
+          exchange.lastAssistantLine = lineNumber;
+          exchange.timestamp = timestamp;
+          applyMetadataToCurrentExchange();
+          const toolCalls = extractOpencodeToolCalls(parsed.parts, timestamp);
+          if (toolCalls.length > 0) {
+            exchange.toolCalls.push(...toolCalls);
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  finalizeExchange();
+
+  // Keep TypeScript aware that this intentionally tracks opencode's agent
+  // name only as future metadata; the current DB schema stores version/model.
+  void agent;
+
+  return exchanges;
+}
+
+interface OmpNode {
+  id: string;
+  parentId?: string;
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp: string;
+  lineNumber: number;
+}
+
+function extractOmpText(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  // Include only `text` blocks; skip `thinking` blocks (internal reasoning),
+  // exactly as the Claude parser ignores thinking and opencode ignores reasoning.
+  return content
+    .filter(block => block && block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n');
+}
+
+/**
+ * Parse an Oh My Pi (OMP) pi-lineage transcript.
+ *
+ * OMP entries form a TREE via id/parentId; the real conversation is the active
+ * path from the current leaf back to the root. Active-leaf rule: the last
+ * `type:"message"` entry in file order. Transcripts are append-only, so the
+ * most recently written message is the current tip; abandoned/regenerated
+ * branches remain earlier in the file but are not on the leaf's parentId chain.
+ * Non-message entries (model_change, thinking_level_change, custom, compaction,
+ * ...) are tree nodes too: a message's parent is often one of them, so the walk
+ * follows every id-bearing entry and keeps only the messages it passes. We
+ * follow parentId from that leaf up to the root (an entry whose parentId is
+ * null/absent or not present in the file), then reverse to root->leaf order and
+ * linearize. Because parents are always written before their children, line
+ * numbers stay monotonic along the chain, keeping the #152 high-water mark and
+ * #139 byte-cap correct. A streaming single pass can't do the leaf->root walk,
+ * so we read every line with its line number first, then walk the tree.
+ */
+async function parseOmpConversation(
+  filePath: string,
+  projectName: string,
+  archivePath: string
+): Promise<ConversationExchange[]> {
+  const exchanges: ConversationExchange[] = [];
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  let sessionId: string | undefined;
+  let cwd: string | undefined;
+  let headerTimestamp: string | undefined;
+  const nodesById = new Map<string, OmpNode>();
+  const parentById = new Map<string, string | undefined>();
+  let leafId: string | undefined;
+
+  let lineNumber = 0;
+  for await (const line of rl) {
+    lineNumber++;
+    if (!line.trim()) {
+      continue;
+    }
+
+    let parsed: OmpJsonlLine;
+    try {
+      parsed = JSON.parse(line) as OmpJsonlLine;
+    } catch {
+      continue;
+    }
+
+    if (parsed.type === 'session') {
+      sessionId = parsed.id ?? sessionId;
+      cwd = parsed.cwd ?? cwd;
+      headerTimestamp = parsed.timestamp ?? headerTimestamp;
+      continue;
+    }
+
+    if (parsed.id) {
+      parentById.set(parsed.id, parsed.parentId ?? undefined);
+    }
+
+    // Skip title/session_init/custom line types and malformed messages.
+    if (parsed.type !== 'message' || !parsed.message || !parsed.message.role || !parsed.id) {
+      continue;
+    }
+
+    const node: OmpNode = {
+      id: parsed.id,
+      parentId: parsed.parentId ?? undefined,
+      role: parsed.message.role,
+      text: extractOmpText(parsed.message.content),
+      timestamp: parsed.timestamp || headerTimestamp || new Date().toISOString(),
+      lineNumber
+    };
+    nodesById.set(node.id, node);
+    leafId = node.id; // the last message wins as the active leaf
+  }
+
+  // Walk from the active leaf back to the root through every entry, guarding
+  // against cycles; only message entries join the chain.
+  const chain: OmpNode[] = [];
+  const seen = new Set<string>();
+  let currentId: string | undefined = leafId;
+  while (currentId && parentById.has(currentId) && !seen.has(currentId)) {
+    seen.add(currentId);
+    const node = nodesById.get(currentId);
+    if (node) {
+      chain.push(node);
+    }
+    currentId = parentById.get(currentId);
+  }
+  chain.reverse(); // root -> leaf
+
+  const project = projectFromCwd(cwd) || projectName;
+  let currentExchange: ExchangeBuilder | null = null;
+
+  const finalizeExchange = () => {
+    if (currentExchange && currentExchange.assistantMessages.length > 0) {
+      const exchangeId = crypto
+        .createHash('md5')
+        .update(`${archivePath}:${currentExchange.userLine}-${currentExchange.lastAssistantLine}`)
+        .digest('hex');
+
+      exchanges.push({
+        id: exchangeId,
+        project: currentExchange.project,
+        timestamp: currentExchange.timestamp,
+        userMessage: currentExchange.userMessage,
+        assistantMessage: currentExchange.assistantMessages.join('\n\n'),
+        archivePath,
+        lineStart: currentExchange.userLine,
+        lineEnd: currentExchange.lastAssistantLine,
+        harness: 'omp',
+        sessionId: currentExchange.sessionId,
+        cwd: currentExchange.cwd
+      });
+    }
+    currentExchange = null;
+  };
+
+  for (const node of chain) {
+    if (node.role === 'user') {
+      finalizeExchange();
+      currentExchange = {
+        project,
+        userMessage: node.text || '(no content)',
+        userLine: node.lineNumber,
+        assistantMessages: [],
+        lastAssistantLine: node.lineNumber,
+        timestamp: node.timestamp,
+        harness: 'omp',
+        sessionId,
+        cwd,
+        toolCalls: []
+      };
+    } else if (node.role === 'assistant' && currentExchange) {
+      if (node.text.trim()) {
+        currentExchange.assistantMessages.push(node.text);
+      }
+      currentExchange.lastAssistantLine = node.lineNumber;
+      currentExchange.timestamp = node.timestamp;
+    }
+  }
+
+  finalizeExchange();
+
+  return exchanges;
+}
+
+// Codex injects system context as ordinary user-role message items with no field
+// that tells them apart from typed prompts. The only safe content signal is a
+// COMPLETE canonical fragment: an input_text block that is exactly one wrapper
+// element, or the AGENTS.md instructions block. A prefix is not enough — a typed
+// prompt may open with an XML snippet or a look-alike heading. Only wrappers
+// that Codex emits with role "user" are listed: observed in rollouts
+// (<environment_context>, <recommended_plugins>, <skill>, "# AGENTS.md
+// instructions" + <INSTRUCTIONS>) or defined with role user in codex-rs
+// (legacy <user_instructions>, <subagent_notification>). Developer-role wrappers
+// (<multi_agent_mode>, <skills_instructions>, ...) never reach the user branch.
+const CODEX_INJECTED_OPEN = /^<(environment_context|recommended_plugins|skill|user_instructions|subagent_notification)(?:\s[^>]*)?>/;
+const CODEX_AGENTS_MD_OPEN = /^# AGENTS\.md instructions(?: for [^\n]*)?\n\n<INSTRUCTIONS>\n/;
+
+// Exactly one wrapper element: the block opens with the tag and the FIRST matching
+// closing tag is the very end of the block — so "<skill>..</skill> question
+// <skill>..</skill>" (text between elements, or several elements) is user text.
+function endsAtFirstClose(text: string, closing: string): boolean {
+  const close = text.indexOf(closing);
+  return close !== -1 && close + closing.length === text.length;
+}
+
+function isCodexInjectedBlock(text: string): boolean {
+  const trimmed = text.trim();
+  if (CODEX_AGENTS_MD_OPEN.test(trimmed)) {
+    return endsAtFirstClose(trimmed, '</INSTRUCTIONS>');
+  }
+  const open = CODEX_INJECTED_OPEN.exec(trimmed);
+  return open !== null && endsAtFirstClose(trimmed, '</' + open[1] + '>');
+}
+
+// Split a Codex user item into the user's own text and the number of injected
+// blocks it carried — block by block, so a real request that shares an item with
+// an injected block is kept.
+function splitCodexUserContent(content: unknown): { userText: string; injected: number } {
+  const blocks: any[] = typeof content === 'string'
+    ? [{ type: 'input_text', text: content }]
+    : Array.isArray(content) ? content : [];
+  let injected = 0;
+  const kept = blocks.filter(block => {
+    if (block && typeof block.text === 'string' && isCodexInjectedBlock(block.text)) {
+      injected++;
+      return false;
+    }
+    return true;
+  });
+  return { userText: extractTextFromContent(kept), injected };
+}
+
+async function parseCodexConversation(
+  filePath: string,
+  projectName: string,
+  archivePath: string
+): Promise<ConversationExchange[]> {
+  const exchanges: ConversationExchange[] = [];
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  let lineNumber = 0;
+  let sessionId: string | undefined;
+  let cwd: string | undefined;
+  let gitBranch: string | undefined;
+  let agentVersion: string | undefined;
+  let model: string | undefined;
+  let modelProvider: string | undefined;
+  let currentExchange: ExchangeBuilder | null = null;
+  // A user item from which injected blocks were removed: either held back entirely
+  // (injected-only, while an exchange was open) or trimmed to its remaining text.
+  // If the very next event vouches for the ORIGINAL text as a typed UserMessage,
+  // the full authored prompt is restored.
+  let pendingInjected: { text: string; line: number; timestamp: string; held: boolean } | null = null;
+  const toolCallsByCallId = new Map<string, ToolCall>();
+
+  const currentProject = () => projectFromCwd(cwd) || projectName;
+
+  const applyMetadataToCurrentExchange = () => {
+    if (!currentExchange) {
+      return;
+    }
+    currentExchange.project = currentProject();
+    currentExchange.sessionId = sessionId;
+    currentExchange.cwd = cwd;
+    currentExchange.gitBranch = gitBranch;
+    currentExchange.agentVersion = agentVersion;
+    currentExchange.model = model;
+    currentExchange.modelProvider = modelProvider;
+  };
+
+  const finalizeExchange = () => {
+    if (currentExchange && currentExchange.assistantMessages.length > 0) {
+      applyMetadataToCurrentExchange();
+      const exchangeId = crypto
+        .createHash('md5')
+        .update(`${archivePath}:${currentExchange.userLine}-${currentExchange.lastAssistantLine}`)
+        .digest('hex');
+
+      const toolCalls = currentExchange.toolCalls.map(tc => ({
+        ...tc,
+        exchangeId
+      }));
+
+      exchanges.push({
+        id: exchangeId,
+        project: currentExchange.project,
+        timestamp: currentExchange.timestamp,
+        userMessage: currentExchange.userMessage,
+        assistantMessage: currentExchange.assistantMessages.join('\n\n'),
+        archivePath,
+        lineStart: currentExchange.userLine,
+        lineEnd: currentExchange.lastAssistantLine,
+        harness: 'codex',
+        sessionId: currentExchange.sessionId,
+        cwd: currentExchange.cwd,
+        gitBranch: currentExchange.gitBranch,
+        agentVersion: currentExchange.agentVersion,
+        model: currentExchange.model,
+        modelProvider: currentExchange.modelProvider,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+      });
+    }
+    currentExchange = null;
+    toolCallsByCallId.clear();
+  };
+
+  const startExchange = (text: string, timestamp: string, line: number = lineNumber) => {
+    finalizeExchange();
+    currentExchange = {
+      project: currentProject(),
+      userMessage: text,
+      userLine: line,
+      assistantMessages: [],
+      lastAssistantLine: line,
+      timestamp,
+      harness: 'codex',
+      sessionId,
+      cwd,
+      gitBranch,
+      agentVersion,
+      model,
+      modelProvider,
+      toolCalls: []
+    };
+  };
+
+  const appendToolCall = (payload: any, timestamp: string) => {
+    if (!currentExchange) {
+      return;
+    }
+
+    const callId = payload.call_id || crypto.randomUUID();
+    let toolInput: unknown = payload.arguments;
+    if (typeof toolInput === 'string') {
+      toolInput = safeParseJson(toolInput);
+    } else if (payload.input !== undefined) {
+      toolInput = payload.input;
+    } else if (payload.action !== undefined) {
+      toolInput = payload.action;
+    }
+
+    const toolCall: ToolCall = {
+      id: callId,
+      exchangeId: '',
+      toolName: payload.name || payload.namespace || payload.type || 'unknown',
+      toolInput,
+      isError: false,
+      timestamp
+    };
+
+    currentExchange.toolCalls.push(toolCall);
+    toolCallsByCallId.set(callId, toolCall);
+    currentExchange.lastAssistantLine = lineNumber;
+  };
+
+  const appendToolResult = (payload: any) => {
+    const callId = payload.call_id;
+    if (!callId) {
+      return;
+    }
+    const toolCall = toolCallsByCallId.get(callId);
+    if (!toolCall) {
+      return;
+    }
+    const output = stringifyToolOutput(payload.output);
+    if (output !== undefined) {
+      toolCall.toolResult = output;
+    }
+    currentExchange!.lastAssistantLine = lineNumber;
+  };
+
+  for await (const line of rl) {
+    lineNumber++;
+    if (!line.trim()) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(line) as CodexRolloutLine;
+      const payload = parsed.payload;
+      const timestamp = parsed.timestamp || new Date().toISOString();
+
+      if (parsed.type === 'session_meta' && payload) {
+        sessionId = payload.id || sessionId;
+        cwd = payload.cwd || cwd;
+        gitBranch = payload.git?.branch || gitBranch;
+        agentVersion = payload.cli_version || agentVersion;
+        modelProvider = payload.model_provider || modelProvider;
+        applyMetadataToCurrentExchange();
+        continue;
+      }
+
+      if (parsed.type === 'turn_context' && payload) {
+        cwd = payload.cwd || cwd;
+        model = payload.model || model;
+        applyMetadataToCurrentExchange();
+        continue;
+      }
+
+      // Positive provenance (newer rollouts): each typed prompt is followed by an
+      // item_completed UserMessage event (legacy: a user_message event). If one
+      // vouches for the item we just held back as injected, it was typed after all.
+      if (parsed.type === 'event_msg' && payload && pendingInjected) {
+        let vouched: string | undefined;
+        if (payload.type === 'item_completed' && payload.item?.type === 'UserMessage') {
+          vouched = extractTextFromContent(payload.item.content);
+        } else if (payload.type === 'user_message' && typeof payload.message === 'string') {
+          vouched = payload.message;
+        }
+        if (vouched !== undefined && (!vouched.trim() || vouched.trim() === pendingInjected.text.trim())) {
+          if (pendingInjected.held) {
+            startExchange(pendingInjected.text, pendingInjected.timestamp, pendingInjected.line);
+          } else {
+            // Trimmed item: the exchange it started is the current one.
+            const exchange = currentExchange as ExchangeBuilder | null;
+            if (exchange && exchange.userLine === pendingInjected.line) {
+              exchange.userMessage = pendingInjected.text;
+            }
+          }
+          pendingInjected = null;
+        }
+        continue;
+      }
+
+      if (parsed.type !== 'response_item' || !payload) {
+        continue;
+      }
+      pendingInjected = null;
+
+      if (payload.type === 'message') {
+        const text = extractTextFromContent(payload.content);
+        if (!text.trim()) {
+          continue;
+        }
+
+        if (payload.role === 'user') {
+          const { userText, injected } = splitCodexUserContent(payload.content);
+          if (userText.trim()) {
+            // The user's own words; injected blocks in the same item are dropped, but
+            // the original text is kept so a UserMessage event can restore it.
+            startExchange(userText, timestamp);
+            if (injected > 0) {
+              pendingInjected = { text, line: lineNumber, timestamp, held: false };
+            }
+          } else if (injected > 0 && currentExchange) {
+            // Injected-only item while an exchange is open: it must not split the
+            // exchange; the reply attaches to the typed prompt. Held back in case
+            // the next event proves it was typed.
+            pendingInjected = { text, line: lineNumber, timestamp, held: true };
+          } else {
+            // Nothing open yet (a rollout that starts with injected context):
+            // unchanged behavior, the item starts an exchange.
+            startExchange(text, timestamp);
+          }
+        } else if (payload.role === 'assistant') {
+          const exchange = currentExchange as ExchangeBuilder | null;
+          if (exchange) {
+            exchange.assistantMessages.push(text);
+            exchange.lastAssistantLine = lineNumber;
+            exchange.timestamp = timestamp;
+          }
+        }
+      } else if (payload.type === 'function_call' || payload.type === 'custom_tool_call' || payload.type === 'tool_search_call' || payload.type === 'local_shell_call') {
+        appendToolCall(payload, timestamp);
+      } else if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output' || payload.type === 'tool_search_output' || payload.type === 'local_shell_call_output') {
+        appendToolResult(payload);
+      }
+    } catch {
+      // Skip malformed JSON lines
+      continue;
+    }
+  }
+
+  finalizeExchange();
+
+  return exchanges;
+}
+
+function stripFileScheme(value: string): string {
+  return value.startsWith('file://') ? decodeURI(value.slice('file://'.length)) : value;
+}
+
+/**
+ * Cursor transcripts carry no workspace field; recover the working directory
+ * from tool-call inputs: explicit cwd/working_directory values when present,
+ * otherwise (with `useFilePathFallback`) the longest common directory prefix
+ * of absolute paths the tools touched. The fallback is for the legacy vscdb
+ * importer, which has no other signal; live transcripts have the project slug
+ * in their path, which beats prefix guessing when no explicit cwd exists.
+ */
+export function detectCursorCwd(
+  toolInputs: unknown[],
+  useFilePathFallback = false
+): string | undefined {
+  const cwdCounts = new Map<string, number>();
+  const filePaths: string[] = [];
+
+  for (const input of toolInputs) {
+    if (!input || typeof input !== 'object') continue;
+    const params = input as Record<string, unknown>;
+
+    for (const key of ['cwd', 'working_directory']) {
+      const value = params[key];
+      if (typeof value === 'string' && path.isAbsolute(value)) {
+        cwdCounts.set(value, (cwdCounts.get(value) ?? 0) + 1);
+      }
+    }
+    for (const key of ['targetFile', 'effectiveUri', 'path', 'target_directory']) {
+      const value = params[key];
+      if (typeof value === 'string') {
+        const candidate = stripFileScheme(value);
+        if (path.isAbsolute(candidate)) {
+          filePaths.push(candidate);
+        }
+      }
+    }
+  }
+
+  if (cwdCounts.size > 0) {
+    return [...cwdCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  if (!useFilePathFallback || filePaths.length === 0) {
+    return undefined;
+  }
+  if (filePaths.length === 1) {
+    return path.dirname(filePaths[0]);
+  }
+
+  let prefix = filePaths[0];
+  for (const filePath of filePaths.slice(1)) {
+    while (!filePath.startsWith(prefix)) {
+      prefix = prefix.slice(0, -1);
+      if (!prefix) return undefined;
+    }
+  }
+  // Trim a partially matched final segment ("/repos/proj" matching
+  // "/repos/project-a" and "/repos/project-b" must become "/repos").
+  const lastSep = prefix.lastIndexOf(path.sep);
+  if (lastSep <= 0) return undefined;
+  const dir = prefix.slice(0, prefix.endsWith(path.sep) ? prefix.length - 1 : lastSep);
+  // A one-segment prefix like "/Users" identifies no project.
+  return dir.split(path.sep).filter(Boolean).length >= 2 ? dir : undefined;
+}
+
+function cursorProjectFromPath(filePath: string): string | undefined {
+  // Live transcripts live at <...>/<project-slug>/agent-transcripts/<uuid>/<uuid>.jsonl
+  const parts = filePath.split(path.sep);
+  const idx = parts.indexOf('agent-transcripts');
+  if (idx > 0) {
+    return parts[idx - 1];
+  }
+  return undefined;
+}
+
+const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+async function parseCursorConversation(
+  filePath: string,
+  projectName: string,
+  archivePath: string
+): Promise<ConversationExchange[]> {
+  const exchanges: ConversationExchange[] = [];
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  // Live Cursor transcripts carry no per-message timestamps; fall back to the
+  // file mtime (preserved from the source by sync's copyIfNewer). Legacy
+  // exports from import-cursor-history embed real per-message timestamps.
+  let fallbackTimestamp: string;
+  try {
+    fallbackTimestamp = fs.statSync(filePath).mtime.toISOString();
+  } catch {
+    fallbackTimestamp = new Date().toISOString();
+  }
+
+  let sessionId = path.basename(filePath, '.jsonl').match(UUID_PATTERN)?.[0];
+  let cwd: string | undefined; // only set by legacy-export lines
+  const toolInputs: unknown[] = [];
+  const slugProject = cursorProjectFromPath(archivePath) ?? cursorProjectFromPath(filePath);
+
+  let lineNumber = 0;
+  let currentExchange: ExchangeBuilder | null = null;
+
+  const finalizeExchange = () => {
+    if (currentExchange && currentExchange.assistantMessages.length > 0) {
+      const exchangeId = crypto
+        .createHash('md5')
+        .update(`${archivePath}:${currentExchange.userLine}-${currentExchange.lastAssistantLine}`)
+        .digest('hex');
+
+      const toolCalls = currentExchange.toolCalls.map(tc => ({
+        ...tc,
+        exchangeId
+      }));
+
+      exchanges.push({
+        id: exchangeId,
+        project: currentExchange.project,
+        timestamp: currentExchange.timestamp,
+        userMessage: currentExchange.userMessage,
+        assistantMessage: currentExchange.assistantMessages.join('\n\n'),
+        archivePath,
+        lineStart: currentExchange.userLine,
+        lineEnd: currentExchange.lastAssistantLine,
+        harness: 'cursor',
+        sessionId: currentExchange.sessionId,
+        cwd: currentExchange.cwd,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+      });
+    }
+    currentExchange = null;
+  };
+
+  for await (const line of rl) {
+    lineNumber++;
+    if (!line.trim()) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(line) as CursorTranscriptLine;
+
+      // Skip status/error noise lines and anything that isn't a message
+      if (!parsed.role || !parsed.message) {
+        continue;
+      }
+
+      if (parsed.sessionId) sessionId = parsed.sessionId;
+      if (parsed.cwd) cwd = parsed.cwd;
+      const timestamp = parsed.timestamp || fallbackTimestamp;
+
+      let text = '';
+      const toolCalls: ToolCall[] = [];
+      const content = parsed.message.content;
+
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content
+          .filter(block => block && block.type === 'text' && typeof block.text === 'string')
+          .map(block => block.text)
+          .join('\n');
+
+        if (parsed.role === 'assistant') {
+          for (const block of content) {
+            if (block && block.type === 'tool_use') {
+              if (block.input !== undefined && block.input !== null) {
+                toolInputs.push(block.input);
+              }
+              toolCalls.push({
+                id: crypto.randomUUID(),
+                exchangeId: '',
+                toolName: block.name || 'unknown',
+                toolInput: block.input,
+                isError: false,
+                timestamp
+              });
+            }
+          }
+        }
+      }
+
+      if (parsed.role === 'user') {
+        // Cursor wraps the typed prompt in <user_query> tags; strip the
+        // wrapper so embeddings see only the actual prompt text.
+        text = text.replace(/<\/?user_query>/g, '').trim();
+      }
+
+      if (!text.trim() && toolCalls.length === 0) {
+        continue;
+      }
+
+      if (parsed.role === 'user') {
+        finalizeExchange();
+        currentExchange = {
+          project: projectName,
+          userMessage: text || '(tool results only)',
+          userLine: lineNumber,
+          assistantMessages: [],
+          lastAssistantLine: lineNumber,
+          timestamp,
+          harness: 'cursor',
+          sessionId,
+          cwd,
+          toolCalls: []
+        };
+      } else if (parsed.role === 'assistant' && currentExchange) {
+        if (text.trim()) {
+          currentExchange.assistantMessages.push(text);
+        }
+        currentExchange.lastAssistantLine = lineNumber;
+        if (toolCalls.length > 0) {
+          currentExchange.toolCalls.push(...toolCalls);
+        }
+        if (parsed.timestamp) {
+          currentExchange.timestamp = parsed.timestamp;
+        }
+      }
+    } catch {
+      // Skip malformed JSON lines
+      continue;
+    }
+  }
+
+  finalizeExchange();
+
+  // Live transcripts carry no cwd field; recover it from tool-call inputs and
+  // apply the final values uniformly since a transcript is one session in one
+  // project.
+  cwd = cwd ?? detectCursorCwd(toolInputs);
+  const project = projectFromCwd(cwd) || slugProject || projectName;
+  for (const exchange of exchanges) {
+    exchange.project = project;
+    exchange.sessionId = exchange.sessionId ?? sessionId;
+    exchange.cwd = exchange.cwd ?? cwd;
+  }
+
+  return exchanges;
+}
+
+/**
+ * Convenience function to parse a conversation file
+ * Extracts project name from the file path and returns exchanges with metadata
+ */
+export async function parseConversationFile(filePath: string): Promise<{
+  project: string;
+  exchanges: ConversationExchange[];
+}> {
+  // Extract project name from path (directory name before the .jsonl file).
+  // path.dirname uses the platform's separators, so Windows paths with `\` work too.
+  const parentDir = path.basename(path.dirname(filePath));
+  const project = parentDir && parentDir !== '.' ? parentDir : 'unknown';
+
+  const exchanges = await parseConversation(filePath, project, filePath);
+
+  return {
+    project,
+    exchanges
+  };
+}
